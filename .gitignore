@@ -1,0 +1,31 @@
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Flutter / Dart generated files
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+**/android/.gradle/
+**/ios/Flutter/ephemeral/
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/flutter_export_environment.sh
+
+# Python generated files and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local configuration and runtime databases
+.env
+!.env.example
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3

@@ -1,0 +1,970 @@
+#!/usr/bin/env python3
+"""PIPI 앱 백엔드 API 서버 (FastAPI + SQLite3).
+
+프론트엔드(Flutter Web / Android / iOS)의 모든 기능과 1:1 매칭되는
+RESTful API 및 SQLite 영구 저장소를 제공합니다.
+
+실행 방법:
+    python3 server.py
+    또는: uvicorn server:app --host 0.0.0.0 --port 3000
+기본 포트: 3000 (환경변수 PORT로 변경 가능)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import mimetypes
+import os
+import re
+import secrets
+import sqlite3
+import threading
+from datetime import datetime, timezone
+from typing import Any, Optional
+from urllib.parse import unquote
+
+from fastapi import FastAPI, Depends, Header, HTTPException, Request, APIRouter
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse, Response
+from pydantic import BaseModel
+import uvicorn
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 설정
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DB_PATH = os.environ.get("DB_PATH") or os.path.join(BASE_DIR, "pipi.db")
+DEFAULT_WEB_DIR = os.path.realpath(
+    os.environ.get("WEB_BUILD_DIR") or os.path.join(BASE_DIR, "..", "build", "web")
+)
+
+mimetypes.add_type("application/wasm", ".wasm")
+mimetypes.add_type("application/javascript", ".mjs")
+mimetypes.add_type("model/gltf-binary", ".glb")
+mimetypes.add_type("font/ttf", ".ttf")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 유틸리티
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def sha256_hex(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def stage_for_level(level: int) -> str:
+    if level >= 7:
+        return "adult"
+    if level >= 3:
+        return "teen"
+    return "baby"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 데이터베이스
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class PipiDatabase:
+    """SQLite 기반 사용자/세션/캐릭터/일정 데이터 저장소."""
+
+    def __init__(self, db_path: str = DEFAULT_DB_PATH) -> None:
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON;")
+        return conn
+
+    def _init_schema(self) -> None:
+        with self._lock, self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    intro_seen INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS characters (
+                    user_id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    color TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    level INTEGER NOT NULL DEFAULT 1,
+                    exp INTEGER NOT NULL DEFAULT 0,
+                    stage TEXT NOT NULL DEFAULT 'baby',
+                    intimacy INTEGER NOT NULL DEFAULT 50,
+                    coins INTEGER NOT NULL DEFAULT 100,
+                    snacks INTEGER NOT NULL DEFAULT 5,
+                    owned_items TEXT NOT NULL DEFAULT '[]',
+                    equipped_items TEXT NOT NULL DEFAULT '[]',
+                    last_visit TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    duration_min INTEGER NOT NULL DEFAULT 60,
+                    goal TEXT NOT NULL DEFAULT '',
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    alert_before INTEGER NOT NULL DEFAULT 0,
+                    priority TEXT NOT NULL DEFAULT 'medium',
+                    category TEXT NOT NULL DEFAULT 'personal',
+                    placed_date TEXT,
+                    start_time TEXT,
+                    status TEXT NOT NULL DEFAULT 'placed',
+                    proof_image_path TEXT,
+                    completed_at TEXT,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+                """
+            )
+
+    # ── 세션 ────────────────────────────────────────────────────────
+    def _create_session(self, conn: sqlite3.Connection, user_id: str) -> str:
+        token = secrets.token_urlsafe(32)
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)",
+            (token, user_id, utc_now_iso()),
+        )
+        return token
+
+    def get_user_by_token(self, token: Optional[str]) -> Optional[dict[str, Any]]:
+        if not token:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT u.id, u.password_hash, u.created_at, u.intro_seen
+                FROM sessions s
+                JOIN users u ON u.id = s.user_id
+                WHERE s.token = ?
+                """,
+                (token,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    # ── 인증 ────────────────────────────────────────────────────────
+    def signup(self, user_id: str, password: str) -> tuple[dict[str, Any], str]:
+        trimmed = user_id.strip()
+        if len(trimmed) < 3:
+            raise ValueError("아이디는 최소 3자 이상이어야 합니다.")
+        if len(password) < 4:
+            raise ValueError("비밀번호는 최소 4자 이상이어야 합니다.")
+
+        pw_hash = sha256_hex(password)
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM users WHERE id = ?", (trimmed,)
+            ).fetchone()
+            if exists:
+                raise LookupError("이미 사용 중인 아이디입니다.")
+
+            conn.execute(
+                "INSERT INTO users (id, password_hash, created_at, intro_seen) VALUES (?, ?, ?, 0)",
+                (trimmed, pw_hash, now),
+            )
+            token = self._create_session(conn, trimmed)
+            return {
+                "id": trimmed,
+                "passwordHash": pw_hash,
+                "createdAt": now,
+                "introSeen": False,
+            }, token
+
+    def login(self, user_id: str, password: str) -> tuple[dict[str, Any], str]:
+        trimmed = user_id.strip()
+        if not trimmed or not password:
+            raise ValueError("아이디와 비밀번호를 입력해주세요.")
+
+        pw_hash = sha256_hex(password)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, password_hash, created_at, intro_seen FROM users WHERE id = ?",
+                (trimmed,),
+            ).fetchone()
+            if row is None:
+                raise LookupError("가입되지 않은 아이디입니다.")
+            if row["password_hash"] != pw_hash:
+                raise PermissionError("비밀번호가 올바르지 않습니다.")
+            token = self._create_session(conn, trimmed)
+            return {
+                "id": row["id"],
+                "passwordHash": row["password_hash"],
+                "createdAt": row["created_at"],
+                "introSeen": bool(row["intro_seen"]),
+            }, token
+
+    def social_login(
+        self, provider: str, account_id: Optional[str] = None
+    ) -> tuple[dict[str, Any], str]:
+        normalized_provider = "kakao" if provider == "kakao" else "google"
+        raw_acc = (account_id or "").strip().lower()
+        if raw_acc:
+            safe_acc = re.sub(r"[^a-z0-9._@-]", "_", raw_acc)[:60]
+            prefix = f"{normalized_provider}_"
+            social_id = safe_acc if safe_acc.startswith(prefix) else f"{prefix}{safe_acc}"
+        else:
+            social_id = f"{normalized_provider}_user"
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, password_hash, created_at, intro_seen FROM users WHERE id = ?",
+                (social_id,),
+            ).fetchone()
+            if row is None:
+                pw_hash = sha256_hex(f"{social_id}_social_oauth_salt")
+                now = utc_now_iso()
+                conn.execute(
+                    "INSERT INTO users (id, password_hash, created_at, intro_seen) VALUES (?, ?, ?, 0)",
+                    (social_id, pw_hash, now),
+                )
+                user_dict = {
+                    "id": social_id,
+                    "passwordHash": pw_hash,
+                    "createdAt": now,
+                    "introSeen": False,
+                }
+            else:
+                user_dict = {
+                    "id": row["id"],
+                    "passwordHash": row["password_hash"],
+                    "createdAt": row["created_at"],
+                    "introSeen": bool(row["intro_seen"]),
+                }
+            token = self._create_session(conn, social_id)
+            return user_dict, token
+
+    def logout(self, token: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+
+    def delete_account(self, user_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+    # ── 인트로 ──────────────────────────────────────────────────────
+    def get_intro_seen(self, user_id: str) -> bool:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT intro_seen FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            return bool(row["intro_seen"]) if row else False
+
+    def mark_intro_seen(self, user_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET intro_seen = 1 WHERE id = ?", (user_id,)
+            )
+
+    # ── 캐릭터 ──────────────────────────────────────────────────────
+    def _row_to_character(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "type": row["type"],
+            "color": row["color"],
+            "name": row["name"],
+            "level": row["level"],
+            "exp": row["exp"],
+            "stage": row["stage"],
+            "intimacy": row["intimacy"],
+            "coins": row["coins"],
+            "snacks": row["snacks"],
+            "ownedItems": json.loads(row["owned_items"]),
+            "equippedItems": json.loads(row["equipped_items"]),
+            "lastVisit": row["last_visit"],
+        }
+
+    def get_character(self, user_id: str) -> Optional[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM characters WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            return self._row_to_character(row) if row else None
+
+    def save_character(self, user_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        now = data.get("lastVisit") or utc_now_iso()
+        owned = json.dumps(data.get("ownedItems", []))
+        equipped = json.dumps(data.get("equippedItems", []))
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO characters (
+                    user_id, type, color, name, level, exp, stage,
+                    intimacy, coins, snacks, owned_items, equipped_items, last_visit
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    type=excluded.type,
+                    color=excluded.color,
+                    name=excluded.name,
+                    level=excluded.level,
+                    exp=excluded.exp,
+                    stage=excluded.stage,
+                    intimacy=excluded.intimacy,
+                    coins=excluded.coins,
+                    snacks=excluded.snacks,
+                    owned_items=excluded.owned_items,
+                    equipped_items=excluded.equipped_items,
+                    last_visit=excluded.last_visit
+                """,
+                (
+                    user_id,
+                    data.get("type", "cat"),
+                    data.get("color", "#FFFFFF"),
+                    data.get("name", "피피"),
+                    int(data.get("level", 1)),
+                    int(data.get("exp", 0)),
+                    data.get("stage", "baby"),
+                    int(data.get("intimacy", 50)),
+                    int(data.get("coins", 100)),
+                    int(data.get("snacks", 5)),
+                    owned,
+                    equipped,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM characters WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            return self._row_to_character(row)
+
+    def feed_character(self, user_id: str) -> dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM characters WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if row is None:
+                raise LookupError("캐릭터를 찾을 수 없습니다.")
+            if row["snacks"] <= 0:
+                raise ValueError("간식이 부족합니다.")
+
+            snacks = row["snacks"] - 1
+            exp = row["exp"] + 20
+            level = row["level"]
+            while exp >= 100:
+                exp -= 100
+                level += 1
+            stage = stage_for_level(level)
+            intimacy = min(100, row["intimacy"] + 5)
+
+            conn.execute(
+                """
+                UPDATE characters
+                SET snacks = ?, exp = ?, level = ?, stage = ?, intimacy = ?, last_visit = ?
+                WHERE user_id = ?
+                """,
+                (snacks, exp, level, stage, intimacy, utc_now_iso(), user_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM characters WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            return self._row_to_character(updated)
+
+    def play_character(self, user_id: str) -> dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM characters WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if row is None:
+                raise LookupError("캐릭터를 찾을 수 없습니다.")
+
+            exp = row["exp"] + 15
+            level = row["level"]
+            while exp >= 100:
+                exp -= 100
+                level += 1
+            stage = stage_for_level(level)
+            coins = row["coins"] + 10
+            intimacy = min(100, row["intimacy"] + 4)
+
+            conn.execute(
+                """
+                UPDATE characters
+                SET exp = ?, level = ?, stage = ?, coins = ?, intimacy = ?, last_visit = ?
+                WHERE user_id = ?
+                """,
+                (exp, level, stage, coins, intimacy, utc_now_iso(), user_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM characters WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            return self._row_to_character(updated)
+
+    def delete_character(self, user_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM characters WHERE user_id = ?", (user_id,))
+
+    # ── 할 일 ──────────────────────────────────────────────────────
+    def _row_to_task(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "title": row["title"],
+            "durationMin": row["duration_min"],
+            "goal": row["goal"],
+            "startDate": row["start_date"],
+            "endDate": row["end_date"],
+            "alertBefore": row["alert_before"],
+            "priority": row["priority"],
+            "category": row["category"],
+            "placedDate": row["placed_date"],
+            "startTime": row["start_time"],
+            "status": row["status"],
+            "proofImagePath": row["proof_image_path"],
+            "completedAt": row["completed_at"],
+        }
+
+    def list_tasks(self, user_id: str) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE user_id = ? ORDER BY start_date ASC",
+                (user_id,),
+            ).fetchall()
+            return [self._row_to_task(r) for r in rows]
+
+    def upsert_task(self, user_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        task_id = data["id"]
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, user_id, title, duration_min, goal, start_date, end_date,
+                    alert_before, priority, category, placed_date, start_time,
+                    status, proof_image_path, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title,
+                    duration_min=excluded.duration_min,
+                    goal=excluded.goal,
+                    start_date=excluded.start_date,
+                    end_date=excluded.end_date,
+                    alert_before=excluded.alert_before,
+                    priority=excluded.priority,
+                    category=excluded.category,
+                    placed_date=excluded.placed_date,
+                    start_time=excluded.start_time,
+                    status=excluded.status,
+                    proof_image_path=excluded.proof_image_path,
+                    completed_at=excluded.completed_at
+                WHERE tasks.user_id = excluded.user_id
+                """,
+                (
+                    task_id,
+                    user_id,
+                    data["title"],
+                    int(data.get("durationMin", 60)),
+                    data.get("goal", ""),
+                    data["startDate"],
+                    data["endDate"],
+                    int(data.get("alertBefore", 0)),
+                    data.get("priority", "medium"),
+                    data.get("category", "personal"),
+                    data.get("placedDate"),
+                    data.get("startTime"),
+                    data.get("status", "placed"),
+                    data.get("proofImagePath"),
+                    data.get("completedAt"),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ? AND user_id = ?",
+                (task_id, user_id),
+            ).fetchone()
+            return self._row_to_task(row)
+
+    def delete_task(self, user_id: str, task_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM tasks WHERE id = ? AND user_id = ?",
+                (task_id, user_id),
+            )
+
+    def complete_task(
+        self, user_id: str, task_id: str, proof_image_path: str
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ? AND user_id = ?",
+                (task_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise LookupError("일정을 찾을 수 없습니다.")
+
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'completed', proof_image_path = ?, completed_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (proof_image_path, now, task_id, user_id),
+            )
+            updated_task = conn.execute(
+                "SELECT * FROM tasks WHERE id = ? AND user_id = ?",
+                (task_id, user_id),
+            ).fetchone()
+
+            # 보상 지급 (경험치 +30, 코인 +20, 간식 +1, 애정도 +5)
+            char_row = conn.execute(
+                "SELECT * FROM characters WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if char_row is not None:
+                exp = char_row["exp"] + 30
+                level = char_row["level"]
+                while exp >= 100:
+                    exp -= 100
+                    level += 1
+                stage = stage_for_level(level)
+                conn.execute(
+                    """
+                    UPDATE characters
+                    SET exp = ?, level = ?, stage = ?,
+                        coins = coins + 20, snacks = snacks + 1,
+                        intimacy = MIN(100, intimacy + 5)
+                    WHERE user_id = ?
+                    """,
+                    (exp, level, stage, user_id),
+                )
+
+            return self._row_to_task(updated_task)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Pydantic 요청 모델
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class SignupRequest(BaseModel):
+    id: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    id: str
+    password: str
+
+
+class SocialLoginRequest(BaseModel):
+    provider: str = "kakao"
+    accountId: Optional[str] = None
+    email: Optional[str] = None
+
+
+class CharacterRequest(BaseModel):
+    type: str = "cat"
+    color: str = "#FFFFFF"
+    name: str = "피피"
+    level: int = 1
+    exp: int = 0
+    stage: str = "baby"
+    intimacy: int = 50
+    coins: int = 100
+    snacks: int = 5
+    ownedItems: list = []
+    equippedItems: list = []
+    lastVisit: Optional[str] = None
+
+
+class TaskCreateRequest(BaseModel):
+    id: str
+    title: str
+    durationMin: int = 60
+    goal: str = ""
+    startDate: str
+    endDate: str
+    alertBefore: int = 0
+    priority: str = "medium"
+    category: str = "personal"
+    placedDate: Optional[str] = None
+    startTime: Optional[str] = None
+    status: str = "placed"
+    proofImagePath: Optional[str] = None
+    completedAt: Optional[str] = None
+
+
+class TaskUpdateRequest(BaseModel):
+    title: str
+    durationMin: int = 60
+    goal: str = ""
+    startDate: str
+    endDate: str
+    alertBefore: int = 0
+    priority: str = "medium"
+    category: str = "personal"
+    placedDate: Optional[str] = None
+    startTime: Optional[str] = None
+    status: str = "placed"
+    proofImagePath: Optional[str] = None
+    completedAt: Optional[str] = None
+
+
+class CompleteTaskRequest(BaseModel):
+    proofImagePath: str = "camera_proof"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FastAPI 의존성 (Dependency Injection)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def get_db(request: Request) -> PipiDatabase:
+    """요청별로 앱에 주입된 DB 인스턴스를 반환합니다."""
+    return request.app.state.db
+
+
+def get_bearer_token(authorization: Optional[str] = Header(None)) -> Optional[str]:
+    """Authorization 헤더에서 Bearer 토큰을 추출합니다."""
+    if authorization and authorization.startswith("Bearer "):
+        return authorization[7:].strip()
+    return None
+
+
+def require_user(
+    db: PipiDatabase = Depends(get_db),
+    token: Optional[str] = Depends(get_bearer_token),
+) -> dict[str, Any]:
+    """인증된 사용자를 반환합니다. 미인증 시 401 에러."""
+    if not token:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+    user = db.get_user_by_token(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+    return user
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# API 라우터
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+router = APIRouter(prefix="/api")
+
+
+# ── 1. 헬스체크 ─────────────────────────────────────────────────────
+@router.get("/health")
+def health_check():
+    return {"status": "ok", "service": "pipi-backend"}
+
+
+# ── 2. 인증 ─────────────────────────────────────────────────────────
+@router.post("/auth/signup", status_code=201)
+def signup(body: SignupRequest, db: PipiDatabase = Depends(get_db)):
+    try:
+        user, token = db.signup(body.id, body.password)
+        return {"user": user, "token": token}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@router.post("/auth/login")
+def login(body: LoginRequest, db: PipiDatabase = Depends(get_db)):
+    try:
+        user, token = db.login(body.id, body.password)
+        return {"user": user, "token": token}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@router.post("/auth/social")
+def social_login(body: SocialLoginRequest, db: PipiDatabase = Depends(get_db)):
+    user, token = db.social_login(
+        body.provider,
+        account_id=body.accountId or body.email,
+    )
+    return {"user": user, "token": token}
+
+
+@router.get("/auth/me")
+def get_me(user: dict = Depends(require_user)):
+    return {
+        "id": user["id"],
+        "createdAt": user["created_at"],
+        "introSeen": bool(user["intro_seen"]),
+    }
+
+
+@router.post("/auth/logout")
+def logout(
+    db: PipiDatabase = Depends(get_db),
+    token: Optional[str] = Depends(get_bearer_token),
+):
+    if token:
+        db.logout(token)
+    return {"ok": True}
+
+
+@router.delete("/auth/account")
+def delete_account(
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    db.delete_account(user["id"])
+    return {"ok": True}
+
+
+# ── 3. 인트로 ───────────────────────────────────────────────────────
+@router.get("/intro/status")
+def intro_status(
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    return {"introSeen": db.get_intro_seen(user["id"])}
+
+
+@router.post("/intro/seen")
+def intro_seen(
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    db.mark_intro_seen(user["id"])
+    return {"introSeen": True}
+
+
+# ── 4. 캐릭터 ───────────────────────────────────────────────────────
+@router.get("/character")
+def get_character(
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    char = db.get_character(user["id"])
+    if char is None:
+        raise HTTPException(status_code=404, detail="캐릭터가 없습니다.")
+    return char
+
+
+@router.post("/character")
+def create_character(
+    body: CharacterRequest,
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    saved = db.save_character(user["id"], body.model_dump())
+    return saved
+
+
+@router.put("/character")
+def update_character(
+    body: CharacterRequest,
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    saved = db.save_character(user["id"], body.model_dump())
+    return saved
+
+
+@router.post("/character/feed")
+def feed_character(
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    try:
+        return db.feed_character(user["id"])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/character/play")
+def play_character(
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    try:
+        return db.play_character(user["id"])
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.delete("/character")
+def delete_character_route(
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    db.delete_character(user["id"])
+    return {"ok": True}
+
+
+# ── 5. 할 일 (Tasks) ───────────────────────────────────────────────
+@router.get("/tasks")
+def list_tasks(
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    return {"tasks": db.list_tasks(user["id"])}
+
+
+@router.post("/tasks", status_code=201)
+def create_task(
+    body: TaskCreateRequest,
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    saved = db.upsert_task(user["id"], body.model_dump())
+    return saved
+
+
+@router.put("/tasks/{task_id}")
+def update_task(
+    task_id: str,
+    body: TaskUpdateRequest,
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    data = body.model_dump()
+    data["id"] = task_id
+    saved = db.upsert_task(user["id"], data)
+    return saved
+
+
+@router.post("/tasks/{task_id}/complete")
+def complete_task(
+    task_id: str,
+    body: CompleteTaskRequest,
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    try:
+        updated = db.complete_task(user["id"], task_id, body.proofImagePath)
+        return updated
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.delete("/tasks/{task_id}")
+def delete_task(
+    task_id: str,
+    db: PipiDatabase = Depends(get_db),
+    user: dict = Depends(require_user),
+):
+    db.delete_task(user["id"], task_id)
+    return {"ok": True}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Flutter Web 정적 파일 서빙
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _serve_static(web_dir: str, path: str) -> Response:
+    """Flutter Web 빌드 파일을 서빙합니다 (SPA 폴백 포함)."""
+    web_root = os.path.realpath(web_dir)
+    if not os.path.isdir(web_root):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    rel_path = unquote(path).lstrip("/")
+    # PIPI-APEX- 접두사 제거 (Flutter 빌드 경로 호환)
+    if rel_path == "PIPI-APEX-" or rel_path.startswith("PIPI-APEX-/"):
+        rel_path = rel_path[len("PIPI-APEX-"):].lstrip("/")
+    if not rel_path:
+        rel_path = "index.html"
+
+    target = os.path.realpath(os.path.join(web_root, rel_path))
+    # 경로 탈출 방지
+    if not (target == web_root or target.startswith(web_root + os.sep)):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if os.path.isdir(target):
+        target = os.path.join(target, "index.html")
+
+    if not os.path.isfile(target):
+        # SPA 라우트 폴백: 확장자 없는 경로는 index.html 제공
+        if "." not in os.path.basename(rel_path):
+            index_file = os.path.join(web_root, "index.html")
+            if os.path.isfile(index_file):
+                target = index_file
+            else:
+                raise HTTPException(status_code=404, detail="Not found")
+        else:
+            raise HTTPException(status_code=404, detail="Not found")
+
+    mime_type, _ = mimetypes.guess_type(target)
+    if not mime_type:
+        mime_type = "application/octet-stream"
+
+    return FileResponse(target, media_type=mime_type)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 앱 팩토리
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def create_app(
+    db_path: str = DEFAULT_DB_PATH,
+    web_dir: str = DEFAULT_WEB_DIR,
+) -> FastAPI:
+    """FastAPI 앱을 생성합니다. 테스트 시 db_path를 오버라이드할 수 있습니다."""
+    _app = FastAPI(title="PIPI Backend", version="1.0.0")
+
+    # 상태 주입
+    _app.state.db = PipiDatabase(db_path=db_path)
+    _app.state.web_dir = web_dir
+
+    # CORS 미들웨어 (모든 도메인 허용)
+    _app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # 커스텀 에러 핸들러: 프론트엔드 호환 {"error": "..."} 형식
+    @_app.exception_handler(HTTPException)
+    async def http_exception_handler(request: Request, exc: HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": exc.detail},
+        )
+
+    @_app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "요청 데이터가 올바르지 않습니다."},
+        )
+
+    # API 라우터 등록
+    _app.include_router(router)
+
+    # Flutter Web 정적 파일 (catch-all, API 라우터보다 나중에 등록)
+    @_app.get("/{full_path:path}")
+    def serve_static_files(full_path: str):
+        return _serve_static(_app.state.web_dir, full_path)
+
+    return _app
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 기본 앱 인스턴스 — uvicorn server:app 으로 실행 시 사용
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+app = create_app()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 직접 실행: python3 server.py
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if __name__ == "__main__":
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "3000"))
+    print("=" * 42)
+    print(" Starting PIPI Backend Server (FastAPI)")
+    print(f" Host: http://{host}:{port}")
+    print("=" * 42)
+    print(f"PIPI Backend Server running on http://{host}:{port} (db: {DEFAULT_DB_PATH})")
+    uvicorn.run(app, host=host, port=port)
