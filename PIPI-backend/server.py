@@ -23,6 +23,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 import urllib.error
+import urllib.parse
 import urllib.request
 import bcrypt
 
@@ -817,7 +818,14 @@ class SocialLoginRequest(BaseModel):
 
 
 class KakaoAuthRequest(BaseModel):
-    accessToken: str
+    accessToken: Optional[str] = None
+    code: Optional[str] = None
+    redirectUri: Optional[str] = None
+
+
+class KakaoWebAuthRequest(BaseModel):
+    code: str
+    redirectUri: str
 
 
 class CharacterRequest(BaseModel):
@@ -946,14 +954,12 @@ def social_login(body: SocialLoginRequest, db: PipiDatabase = Depends(get_db)):
     return {"user": user, "token": token}
 
 
-@router.post("/auth/kakao")
-def kakao_login_route(body: KakaoAuthRequest, db: PipiDatabase = Depends(get_db)):
-    """카카오 공식 API 서버로 Access Token을 직접 전송하여 검증하고 회원을 식별합니다."""
-    token_str = body.accessToken.strip()
+def verify_kakao_token_and_login(access_token: str, db: PipiDatabase) -> dict[str, Any]:
+    """카카오 공식 API 서버로 Access Token을 전송하여 사용자 정보를 조회하고 PP 회원을 식별합니다."""
+    token_str = access_token.strip()
     if not token_str:
         raise HTTPException(status_code=400, detail="카카오 액세스 토큰이 필요합니다.")
 
-    # 1. 카카오 사용자 정보 조회 API 호출 (Bearer Token 유효성 검증)
     url = "https://kapi.kakao.com/v2/user/me"
     req = urllib.request.Request(
         url,
@@ -965,16 +971,14 @@ def kakao_login_route(body: KakaoAuthRequest, db: PipiDatabase = Depends(get_db)
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=7) as response:
             res_data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        # 카카오 토큰 만료 또는 위변조된 토큰 (401 Unauthorized)
         raise HTTPException(
             status_code=401,
             detail=f"유효하지 않거나 만료된 카카오 토큰입니다 ({e.code}).",
         )
     except Exception as e:
-        # 네트워크 지연 또는 카카오 서버 장애
         raise HTTPException(
             status_code=502,
             detail=f"카카오 인증 서버에 연결할 수 없습니다: {e}",
@@ -993,6 +997,93 @@ def kakao_login_route(body: KakaoAuthRequest, db: PipiDatabase = Depends(get_db)
 
     user, pp_token = db.kakao_login(str(kakao_id), email=email, nickname=nickname)
     return {"user": user, "token": pp_token}
+
+
+def exchange_kakao_code_for_token(code: str, redirect_uri: str) -> str:
+    """웹 OAuth 2.0 Authorization Code를 카카오 토큰 API와 통신하여 Access Token으로 교환합니다."""
+    client_id = (
+        os.environ.get("KAKAO_REST_API_KEY")
+        or os.environ.get("KAKAO_CLIENT_ID")
+        or ""
+    ).strip()
+    if not client_id:
+        raise HTTPException(
+            status_code=500,
+            detail="서버에 KAKAO_REST_API_KEY 환경 변수가 설정되지 않았습니다. Render 대시보드에서 환경 변수를 등록해주세요.",
+        )
+    client_secret = os.environ.get("KAKAO_CLIENT_SECRET", "").strip()
+
+    token_url = "https://kauth.kakao.com/oauth/token"
+    token_params = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri.strip(),
+        "code": code.strip(),
+    }
+    if client_secret:
+        token_params["client_secret"] = client_secret
+
+    encoded = urllib.parse.urlencode(token_params).encode("utf-8")
+    req = urllib.request.Request(
+        token_url,
+        data=encoded,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=7) as response:
+            token_res = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        try:
+            err_json = json.loads(err_body)
+            err_msg = err_json.get("error_description") or err_json.get("error") or str(e)
+        except Exception:
+            err_msg = str(e)
+        raise HTTPException(
+            status_code=400,
+            detail=f"카카오 인가 코드 교환 실패: {err_msg}",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"카카오 토큰 서버 연결 오류: {e}",
+        )
+
+    access_token = token_res.get("access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=400, detail="카카오 액세스 토큰을 수신하지 못했습니다."
+        )
+    return str(access_token)
+
+
+@router.post("/auth/kakao")
+def kakao_login_route(body: KakaoAuthRequest, db: PipiDatabase = Depends(get_db)):
+    """카카오 공식 API 인증. 모바일(accessToken)과 웹(code+redirectUri)을 모두 지원합니다."""
+    # 1. 모바일: 클라이언트가 이미 발급받은 accessToken을 직접 전달한 경우
+    if body.accessToken and body.accessToken.strip():
+        return verify_kakao_token_and_login(body.accessToken, db)
+
+    # 2. 웹: 클라이언트가 인가 코드(code)와 redirectUri를 전달한 경우 (백엔드 토큰 교환)
+    if body.code and body.code.strip() and body.redirectUri and body.redirectUri.strip():
+        access_token = exchange_kakao_code_for_token(body.code, body.redirectUri)
+        return verify_kakao_token_and_login(access_token, db)
+
+    raise HTTPException(
+        status_code=400,
+        detail="카카오 액세스 토큰 또는 인가 코드(code, redirectUri)가 필요합니다.",
+    )
+
+
+@router.post("/auth/kakao/web")
+def kakao_web_login_route(body: KakaoWebAuthRequest, db: PipiDatabase = Depends(get_db)):
+    """웹 전용 OAuth 2.0 Authorization Code 인증 엔드포인트."""
+    access_token = exchange_kakao_code_for_token(body.code, body.redirectUri)
+    return verify_kakao_token_and_login(access_token, db)
 
 
 @router.get("/auth/me")

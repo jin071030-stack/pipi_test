@@ -18,9 +18,10 @@ Future<void> main() async {
   // Flutter 바인딩 초기화
   WidgetsFlutterBinding.ensureInitialized();
 
-  // 카카오 공식 SDK 초기화 (await 방식)
+  // 카카오 공식 SDK 초기화 (모바일 네이티브 키 및 웹 JavaScript 키 동시 등록)
   await KakaoSdk.init(
     nativeAppKey: KakaoConfig.nativeAppKey,
+    javaScriptAppKey: KakaoConfig.javascriptAppKey,
   );
 
   // 실제 휴대폰 알람 서비스 & 한국 시간대 초기화

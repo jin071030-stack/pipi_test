@@ -22,7 +22,12 @@ import 'signup_screen.dart';
 /// - 비밀번호 SHA-256 일치 검증
 /// - 로그인 상태 유지 세션 생성
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
+  final String? initialErrorMessage;
+
+  const LoginScreen({
+    super.key,
+    this.initialErrorMessage,
+  });
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
@@ -35,6 +40,30 @@ class _LoginScreenState extends State<LoginScreen> {
 
   /// 현재 진행 중인 소셜 로그인 종류 (로딩 스피너 제어용)
   SocialLoginType? _socialLoadingType;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.initialErrorMessage != null &&
+        widget.initialErrorMessage!.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              widget.initialErrorMessage!,
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+            backgroundColor: AppColors.error,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+            ),
+          ),
+        );
+      });
+    }
+  }
 
   @override
   void dispose() {

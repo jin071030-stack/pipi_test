@@ -1,10 +1,13 @@
 import 'dart:convert';
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:kakao_flutter_sdk_user/kakao_flutter_sdk_user.dart' as kakao;
 import 'package:shared_preferences/shared_preferences.dart';
+import '../config/kakao_config.dart';
 import '../models/user.dart';
 import '../services/api_client.dart';
+import '../services/kakao_web_helper.dart';
 
 /// 인증 과정에서 발생하는 오류를 처리하기 위한 예외 클래스
 class AuthException implements Exception {
@@ -355,16 +358,27 @@ class AuthRepository {
     return user;
   }
 
-  /// 카카오 공식 SDK 네이티브 로그인 (카카오톡 설치 여부 판별 및 토큰 발급)
+  /// 카카오 공식 SDK 네이티브 로그인 (모바일/웹 플랫폼 최적화)
   ///
-  /// 흐름:
-  /// 1. 카카오톡 설치 확인:
-  ///    - 설치됨: `loginWithKakaoTalk()` 실행 (카카오톡 앱 인증)
-  ///    - 미설치/오류: `loginWithKakaoAccount()` 실행 (카카오계정 웹 브라우저 인증)
-  /// 2. 발급받은 `OAuthToken.accessToken`을 FastAPI 백엔드로 전송
-  /// 3. 백엔드에서 카카오 사용자 정보 조회 및 검증 후 PP 전용 세션 토큰 발급
-  /// 4. 토큰 및 사용자 정보 안전 저장 후 [User] 반환
+  /// 플랫폼별 처리:
+  /// - 웹: 브라우저를 공식 카카오 OAuth 2.0 인가 페이지로 리다이렉트
+  /// - 모바일: 기존 Flutter Kakao SDK 흐름 (카카오톡 앱 또는 카카오계정 로그인)
   Future<User> loginWithKakao() async {
+    // 0. 웹 플랫폼 분기: 웹에서는 브라우저 리다이렉트 기반 OAuth 2.0 인가 코드 요청 실행
+    if (kIsWeb) {
+      if (KakaoConfig.restApiKey.trim().isEmpty) {
+        throw const AuthException(
+          '카카오 REST API 키가 설정되지 않았습니다. 빌드 시 --dart-define=KAKAO_REST_API_KEY 값을 전달해야 합니다.',
+        );
+      }
+      final redirectUri = KakaoConfig.getEffectiveRedirectUri();
+      final authUrl = KakaoConfig.getAuthorizeUrl(redirectUri);
+      redirectBrowser(authUrl);
+      // 브라우저 페이지 이동 대기 안내
+      await Future.delayed(const Duration(seconds: 3));
+      throw const AuthException('카카오 로그인 페이지로 이동 중입니다...');
+    }
+
     kakao.OAuthToken token;
     try {
       final isInstalled = await kakao.isKakaoTalkInstalled().timeout(
@@ -470,6 +484,54 @@ class AuthRepository {
       return localUser;
     } catch (e) {
       throw AuthException('카카오 사용자 정보를 가져오지 못했습니다: $e');
+    }
+  }
+
+  /// 웹 카카오 OAuth 2.0 Authorization Code 인증 처리
+  ///
+  /// 프론트엔드는 인가 코드(code)와 redirectUri만 백엔드로 전달하며,
+  /// REST API 키나 Client Secret은 백엔드에서만 사용하여 안전하게 카카오 토큰을 교환하고 세션을 발급받습니다.
+  Future<User> loginWithKakaoWebCode({
+    required String code,
+    required String redirectUri,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+
+    try {
+      final apiRes = await ApiClient.instance.request(
+        'POST',
+        '/api/auth/kakao/web',
+        body: {
+          'code': code,
+          'redirectUri': redirectUri,
+        },
+        withAuth: false,
+      );
+
+      if (apiRes != null && apiRes['user'] is Map<String, dynamic>) {
+        final ppToken = apiRes['token'] as String?;
+        if (ppToken != null && ppToken.isNotEmpty) {
+          await ApiClient.instance.saveToken(ppToken);
+        }
+        final userMap = apiRes['user'] as Map<String, dynamic>;
+        final apiUser = User.fromJson(userMap);
+        await prefs.setString(
+            '$_userDataPrefix${apiUser.id}', jsonEncode(apiUser.toJson()));
+        final userIds = prefs.getStringList(_registeredUserIdsKey) ?? [];
+        if (!userIds.contains(apiUser.id)) {
+          userIds.add(apiUser.id);
+          await prefs.setStringList(_registeredUserIdsKey, userIds);
+        }
+        await prefs.setString(_currentUserIdKey, apiUser.id);
+        return apiUser;
+      } else {
+        throw const AuthException('유효하지 않은 백엔드 인증 응답입니다.');
+      }
+    } on ApiHttpException catch (e) {
+      throw AuthException(e.message);
+    } catch (e) {
+      if (e is AuthException) rethrow;
+      throw AuthException('카카오 웹 로그인 처리 실패: $e');
     }
   }
 
