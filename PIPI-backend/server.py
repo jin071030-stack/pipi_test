@@ -12,38 +12,36 @@ RESTful API 및 SQLite 영구 저장소를 제공합니다.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
-import mimetypes
 import os
 import re
 import secrets
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
-from urllib.parse import unquote
+import urllib.error
+import urllib.request
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Request, APIRouter
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, Response
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 설정
+# 설정 (모바일 앱 전용 API 백엔드)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB_PATH = os.environ.get("DB_PATH") or os.path.join(BASE_DIR, "pipi.db")
-DEFAULT_WEB_DIR = os.path.realpath(
-    os.environ.get("WEB_BUILD_DIR") or os.path.join(BASE_DIR, "..", "build", "web")
-)
 
-mimetypes.add_type("application/wasm", ".wasm")
-mimetypes.add_type("application/javascript", ".mjs")
-mimetypes.add_type("model/gltf-binary", ".glb")
-mimetypes.add_type("font/ttf", ".ttf")
+
+# 세션 만료 시간 (7일)
+SESSION_TTL = timedelta(days=7)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -76,11 +74,16 @@ class PipiDatabase:
         self._lock = threading.Lock()
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         with self._lock, self._connect() as conn:
@@ -139,6 +142,16 @@ class PipiDatabase:
             )
 
     # ── 세션 ────────────────────────────────────────────────────────
+    def cleanup_expired_sessions(self) -> int:
+        """7일 이상 경과한 모든 만료 세션을 DB에서 일괄 정리합니다."""
+        now = datetime.now(timezone.utc)
+        threshold = (now - SESSION_TTL).isoformat()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM sessions WHERE created_at < ?", (threshold,)
+            )
+            return cursor.rowcount
+
     def _create_session(self, conn: sqlite3.Connection, user_id: str) -> str:
         token = secrets.token_urlsafe(32)
         conn.execute(
@@ -153,14 +166,44 @@ class PipiDatabase:
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT u.id, u.password_hash, u.created_at, u.intro_seen
+                SELECT u.id, u.password_hash, u.created_at, u.intro_seen, s.created_at AS session_created_at
                 FROM sessions s
                 JOIN users u ON u.id = s.user_id
                 WHERE s.token = ?
                 """,
                 (token,),
             ).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+
+            # 1. session_created_at 존재 및 형식 검증
+            raw_created_at = row["session_created_at"]
+            if not raw_created_at:
+                conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                return None
+
+            try:
+                session_dt = datetime.fromisoformat(raw_created_at)
+                if session_dt.tzinfo is None:
+                    session_dt = session_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                # created_at이 비정상/손상된 형식이면 즉시 폐기하고 인증 거부
+                conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                return None
+
+            # 2. 7일 만료 시간 검증 (순수 UTC 기준)
+            now_utc = datetime.now(timezone.utc)
+            if now_utc - session_dt > SESSION_TTL:
+                # 7일 초과 시 만료 세션을 DB에서 자동 삭제하고 인증 거부
+                conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                return None
+
+            return {
+                "id": row["id"],
+                "password_hash": row["password_hash"],
+                "created_at": row["created_at"],
+                "intro_seen": row["intro_seen"],
+            }
 
     # ── 인증 ────────────────────────────────────────────────────────
     def signup(self, user_id: str, password: str) -> tuple[dict[str, Any], str]:
@@ -251,6 +294,42 @@ class PipiDatabase:
                     "introSeen": bool(row["intro_seen"]),
                 }
             token = self._create_session(conn, social_id)
+            return user_dict, token
+
+    def kakao_login(
+        self,
+        kakao_id: str,
+        email: Optional[str] = None,
+        nickname: Optional[str] = None,
+    ) -> tuple[dict[str, Any], str]:
+        """검증된 카카오 고유 회원번호로 회원을 조회하거나 신규 등록하고 세션 토큰을 발급합니다."""
+        user_id = f"kakao_{kakao_id}"
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, password_hash, created_at, intro_seen FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                pw_hash = sha256_hex(f"{user_id}_kakao_verified_salt")
+                now = utc_now_iso()
+                conn.execute(
+                    "INSERT INTO users (id, password_hash, created_at, intro_seen) VALUES (?, ?, ?, 0)",
+                    (user_id, pw_hash, now),
+                )
+                user_dict = {
+                    "id": user_id,
+                    "passwordHash": pw_hash,
+                    "createdAt": now,
+                    "introSeen": False,
+                }
+            else:
+                user_dict = {
+                    "id": row["id"],
+                    "passwordHash": row["password_hash"],
+                    "createdAt": row["created_at"],
+                    "introSeen": bool(row["intro_seen"]),
+                }
+            token = self._create_session(conn, user_id)
             return user_dict, token
 
     def logout(self, token: str) -> None:
@@ -564,6 +643,10 @@ class SocialLoginRequest(BaseModel):
     email: Optional[str] = None
 
 
+class KakaoAuthRequest(BaseModel):
+    accessToken: str
+
+
 class CharacterRequest(BaseModel):
     type: str = "cat"
     color: str = "#FFFFFF"
@@ -688,6 +771,55 @@ def social_login(body: SocialLoginRequest, db: PipiDatabase = Depends(get_db)):
         account_id=body.accountId or body.email,
     )
     return {"user": user, "token": token}
+
+
+@router.post("/auth/kakao")
+def kakao_login_route(body: KakaoAuthRequest, db: PipiDatabase = Depends(get_db)):
+    """카카오 공식 API 서버로 Access Token을 직접 전송하여 검증하고 회원을 식별합니다."""
+    token_str = body.accessToken.strip()
+    if not token_str:
+        raise HTTPException(status_code=400, detail="카카오 액세스 토큰이 필요합니다.")
+
+    # 1. 카카오 사용자 정보 조회 API 호출 (Bearer Token 유효성 검증)
+    url = "https://kapi.kakao.com/v2/user/me"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token_str}",
+            "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # 카카오 토큰 만료 또는 위변조된 토큰 (401 Unauthorized)
+        raise HTTPException(
+            status_code=401,
+            detail=f"유효하지 않거나 만료된 카카오 토큰입니다 ({e.code}).",
+        )
+    except Exception as e:
+        # 네트워크 지연 또는 카카오 서버 장애
+        raise HTTPException(
+            status_code=502,
+            detail=f"카카오 인증 서버에 연결할 수 없습니다: {e}",
+        )
+
+    kakao_id = res_data.get("id")
+    if not kakao_id:
+        raise HTTPException(
+            status_code=400, detail="카카오 회원 식별자를 확인할 수 없습니다."
+        )
+
+    kakao_account = res_data.get("kakao_account", {})
+    email = kakao_account.get("email")
+    profile = kakao_account.get("profile", {})
+    nickname = profile.get("nickname")
+
+    user, pp_token = db.kakao_login(str(kakao_id), email=email, nickname=nickname)
+    return {"user": user, "token": pp_token}
 
 
 @router.get("/auth/me")
@@ -858,62 +990,18 @@ def delete_task(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Flutter Web 정적 파일 서빙
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def _serve_static(web_dir: str, path: str) -> Response:
-    """Flutter Web 빌드 파일을 서빙합니다 (SPA 폴백 포함)."""
-    web_root = os.path.realpath(web_dir)
-    if not os.path.isdir(web_root):
-        raise HTTPException(status_code=404, detail="Not found")
-
-    rel_path = unquote(path).lstrip("/")
-    # PIPI-APEX- 접두사 제거 (Flutter 빌드 경로 호환)
-    if rel_path == "PIPI-APEX-" or rel_path.startswith("PIPI-APEX-/"):
-        rel_path = rel_path[len("PIPI-APEX-"):].lstrip("/")
-    if not rel_path:
-        rel_path = "index.html"
-
-    target = os.path.realpath(os.path.join(web_root, rel_path))
-    # 경로 탈출 방지
-    if not (target == web_root or target.startswith(web_root + os.sep)):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    if os.path.isdir(target):
-        target = os.path.join(target, "index.html")
-
-    if not os.path.isfile(target):
-        # SPA 라우트 폴백: 확장자 없는 경로는 index.html 제공
-        if "." not in os.path.basename(rel_path):
-            index_file = os.path.join(web_root, "index.html")
-            if os.path.isfile(index_file):
-                target = index_file
-            else:
-                raise HTTPException(status_code=404, detail="Not found")
-        else:
-            raise HTTPException(status_code=404, detail="Not found")
-
-    mime_type, _ = mimetypes.guess_type(target)
-    if not mime_type:
-        mime_type = "application/octet-stream"
-
-    return FileResponse(target, media_type=mime_type)
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 앱 팩토리
+# 앱 팩토리 (모바일 앱 전용 RESTful API 서버)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def create_app(
     db_path: str = DEFAULT_DB_PATH,
-    web_dir: str = DEFAULT_WEB_DIR,
 ) -> FastAPI:
     """FastAPI 앱을 생성합니다. 테스트 시 db_path를 오버라이드할 수 있습니다."""
-    _app = FastAPI(title="PIPI Backend", version="1.0.0")
+    _app = FastAPI(title="PIPI Mobile Backend", version="1.0.0")
 
     # 상태 주입
     _app.state.db = PipiDatabase(db_path=db_path)
-    _app.state.web_dir = web_dir
 
-    # CORS 미들웨어 (모든 도메인 허용)
+    # CORS 미들웨어 (모든 모바일 클라이언트 요청 허용)
     _app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -942,10 +1030,28 @@ def create_app(
     # API 라우터 등록
     _app.include_router(router)
 
-    # Flutter Web 정적 파일 (catch-all, API 라우터보다 나중에 등록)
-    @_app.get("/{full_path:path}")
-    def serve_static_files(full_path: str):
-        return _serve_static(_app.state.web_dir, full_path)
+    # 모바일 웹 직접 테스트 및 QR 실시간 시연 시 브라우저(사파리/크롬) 캐싱 방지
+    @_app.middleware("http")
+    async def add_no_cache_header(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
+    # 모바일 웹 직접 테스트 및 QR 실시간 시연 지원 (build/web 이 존재할 경우)
+    frontend_web = os.path.realpath(os.path.join(BASE_DIR, "..", "PIPI - frontend", "build", "web"))
+    if os.path.isdir(frontend_web):
+        _app.mount("/", StaticFiles(directory=frontend_web, html=True), name="static")
+    else:
+        # 루트 엔드포인트: 모바일 API 서버 상태
+        @_app.get("/")
+        def root():
+            return {
+                "service": "pipi-mobile-backend",
+                "status": "running",
+                "mode": "mobile_app_only",
+            }
 
     return _app
 

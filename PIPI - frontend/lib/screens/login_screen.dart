@@ -114,9 +114,44 @@ class _LoginScreenState extends State<LoginScreen> {
     FocusScope.of(context).unfocus();
 
     final authProvider = context.read<AuthProvider>();
-    final provider = type == SocialLoginType.kakao
-        ? SocialProvider.kakao
-        : SocialProvider.google;
+
+    // 1. 카카오 공식 SDK 네이티브 로그인 (카카오톡 앱 또는 카카오계정)
+    if (type == SocialLoginType.kakao) {
+      setState(() {
+        _socialLoadingType = type;
+      });
+
+      final success = await authProvider.loginWithKakao();
+
+      if (!mounted) return;
+
+      setState(() {
+        _socialLoadingType = null;
+      });
+
+      if (success) {
+        await _navigateAfterAuth(authProvider);
+      } else if (authProvider.errorMessage != null &&
+          !authProvider.errorMessage!.contains('취소')) {
+        // 취소된 경우가 아닌 실제 오류인 경우에만 스낵바 표시
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              authProvider.errorMessage ?? '카카오 로그인에 실패했습니다.',
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+            backgroundColor: AppColors.error,
+            behavior: SnackBarBehavior.floating,
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+        );
+      }
+      return;
+    }
+
+    // 2. 구글 계정 로그인 (기존 흐름 보존)
+    final provider = SocialProvider.google;
 
     final remembered = await authProvider.getRememberedSocialAccounts(provider);
     if (!mounted) return;

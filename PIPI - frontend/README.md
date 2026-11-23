@@ -62,16 +62,17 @@ GitHub Pages를 통해 24시간 365일 언제나 동일한 주소로 유지됩�
 
 ### 1. 백엔드 서버 실행
 ```bash
-python3 backend/server.py
+(cd ../PIPI-backend && python3 server.py)
 # http://localhost:3000 에서 실행됩니다.
 ```
 
 ### 2. 프론트엔드 앱 실행 (Flutter)
 ```bash
+export PATH="$HOME/development/flutter/bin:$PATH"
 flutter pub get
 
-# Chrome 웹으로 실행
-flutter run -d chrome
+# Chrome 웹으로 실행 (백엔드 localhost:3000 연결)
+flutter run -d chrome --web-port=8080
 
 # Android 에뮬레이터 또는 기기
 flutter run -d android
@@ -80,10 +81,14 @@ flutter run -d android
 flutter run -d ios
 ```
 
-### 3. 모바일 시연 터널 및 QR 생성 스크립트
+### 3. 프론트엔드와 백엔드를 함께 실행
 ```bash
 ./start_demo.sh
 ```
+스크립트가 Flutter Web을 빌드하고 백엔드를 시작합니다. 웹 앱과 `/api` 요청을
+같은 주소에서 제공하므로 CORS 설정 없이 `http://localhost:3000`에서 테스트할 수
+있습니다. 같은 Wi-Fi의 다른 기기에서 테스트하려면 `HOST=0.0.0.0 ./start_demo.sh`를
+실행한 뒤 출력된 로컬 네트워크 주소를 여세요.
 
 ---
 

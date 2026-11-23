@@ -42,14 +42,22 @@ class CharacterView extends StatelessWidget {
   Color? _resolveColor() {
     if (customColor != null) return customColor;
     if (colorHex != null && colorHex!.isNotEmpty) {
-      final clean = colorHex!.replaceFirst('#', '');
+      final trimmed = colorHex!.trim().toLowerCase();
+      // 'default' 또는 미지정인 경우 원본 에셋 색상 그대로 렌더링
+      if (trimmed == 'default' || trimmed == '#default' || trimmed == 'none') {
+        return null;
+      }
+      final clean = trimmed.replaceFirst('#', '');
       try {
         if (clean.length == 6) {
           return Color(int.parse('FF$clean', radix: 16));
         } else if (clean.length == 8) {
           return Color(int.parse(clean, radix: 16));
         }
-      } catch (_) {}
+      } catch (_) {
+        // 잘못된 HEX 형식이면 기본 색상(null)으로 안전하게 폴백
+        return null;
+      }
     }
     return accentColor;
   }
@@ -60,7 +68,8 @@ class CharacterView extends StatelessWidget {
       characterType: characterType,
       size: size,
       animated: animated,
-      customColor: _resolveColor(),
+      customColor: customColor ?? accentColor,
+      paletteKey: colorHex,
       enableRoam: enableRoam,
       forcedBehavior: forcedBehavior,
       actionTrigger: actionTrigger,

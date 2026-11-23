@@ -162,6 +162,31 @@ class AuthProvider with ChangeNotifier {
     }
   }
 
+  /// 카카오 공식 SDK 기반 네이티브 로그인
+  Future<bool> loginWithKakao() async {
+    _isLoading = true;
+    _errorMessage = null;
+    notifyListeners();
+
+    try {
+      final user = await _authRepository.loginWithKakao();
+      _currentUser = user;
+      _isLoading = false;
+      notifyListeners();
+      return true;
+    } on AuthException catch (e) {
+      _errorMessage = e.message;
+      _isLoading = false;
+      notifyListeners();
+      return false;
+    } catch (e) {
+      _errorMessage = '카카오 로그인 중 오류가 발생했습니다: $e';
+      _isLoading = false;
+      notifyListeners();
+      return false;
+    }
+  }
+
   /// 로그아웃 처리
   /// 
   /// 로컬 세션을 제거하고 상태를 초기화합니다.
