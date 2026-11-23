@@ -27,5 +27,6 @@ venv/
 !.env.example
 *.db
 *.db-journal
+*.db.backup
 *.sqlite
 *.sqlite3

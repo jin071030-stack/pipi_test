@@ -24,6 +24,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 import urllib.error
 import urllib.request
+import bcrypt
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Request, APIRouter
 from fastapi.exceptions import RequestValidationError
@@ -55,6 +56,33 @@ def sha256_hex(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def hash_password(raw: str) -> str:
+    """bcrypt 솔트 및 단방향 해싱 (새 회원가입 및 비밀번호 갱신 시 적용)."""
+    return bcrypt.hashpw(raw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(raw: str, stored_hash: str) -> tuple[bool, bool]:
+    """비밀번호 검증 및 기존 레거시 SHA-256 마이그레이션 필요 여부 판별.
+
+    반환값: (is_valid: bool, needs_rehash: bool)
+    - 최신 bcrypt 해시($2a$, $2b$): bcrypt 검증 진행, needs_rehash=False
+    - 레거시 SHA-256 해시: sha256_hex 검증 진행, 일치 시 needs_rehash=True (bcrypt 자동 업그레이드)
+    """
+    if stored_hash.startswith(("$2a$", "$2b$")):
+        try:
+            valid = bcrypt.checkpw(raw.encode("utf-8"), stored_hash.encode("utf-8"))
+            return valid, False
+        except Exception:
+            return False, False
+
+    # 기존 레거시 SHA-256 회원 호환성 보존
+    legacy_hash = sha256_hex(raw)
+    if stored_hash == legacy_hash:
+        return True, True
+
+    return False, False
+
+
 def stage_for_level(level: int) -> str:
     if level >= 7:
         return "adult"
@@ -73,6 +101,7 @@ class PipiDatabase:
         self.db_path = db_path
         self._lock = threading.Lock()
         self._init_schema()
+        self._init_demo_account()
 
     @contextmanager
     def _connect(self):
@@ -84,6 +113,139 @@ class PipiDatabase:
                 yield conn
         finally:
             conn.close()
+
+    def _init_demo_account(self) -> None:
+        """발표 당일 참석자용 공통 시연 계정, 기본 펫, 기본 일정을 자동 준비합니다.
+
+        - 환경변수(DEMO_USER_ID, DEMO_EMAIL, DEMO_PASSWORD, DEMO_USER_PASSWORD)로 설정 시에만 활성화
+        - 기본 하드코딩 계정/비밀번호는 일체 노출하지 않음
+        - 계정이 이미 존재하면 중복 생성 및 데이터 덮어쓰기 방지
+        - 비밀번호는 bcrypt 솔트 및 해시로 안전 저장
+        """
+        demo_id = (
+            os.environ.get("DEMO_USER_ID")
+            or os.environ.get("DEMO_EMAIL")
+            or os.environ.get("DEMO_ID")
+            or ""
+        ).strip()
+        demo_pw = (
+            os.environ.get("DEMO_USER_PASSWORD")
+            or os.environ.get("DEMO_PASSWORD")
+            or ""
+        ).strip()
+
+        # 환경변수로 시연 계정이 지정되지 않은 경우 계정을 자동 생성하지 않음 (공개 저장소 보안)
+        if not demo_id or not demo_pw:
+            return
+
+        now = utc_now_iso()
+        today_date = datetime.now(timezone.utc).date().isoformat()
+        pw_hash = hash_password(demo_pw)
+
+        with self._lock, self._connect() as conn:
+            # 1. 공통 시연 계정 존재 여부 확인 (기존 일반 계정 및 중복 생성 방지)
+            user_row = conn.execute(
+                "SELECT id FROM users WHERE id = ?", (demo_id,)
+            ).fetchone()
+
+            if user_row is None:
+                # 시연 계정 자동 생성 (introSeen=1로 설정하여 스플래시 후 홈으로 바로 진입 가능)
+                conn.execute(
+                    """
+                    INSERT INTO users (id, password_hash, created_at, intro_seen)
+                    VALUES (?, ?, ?, 1)
+                    """,
+                    (demo_id, pw_hash, now),
+                )
+
+            # 2. 시연용 기본 펫 확인 및 최초 1회 생성
+            char_row = conn.execute(
+                "SELECT user_id FROM characters WHERE user_id = ?", (demo_id,)
+            ).fetchone()
+            if char_row is None:
+                conn.execute(
+                    """
+                    INSERT INTO characters (
+                        user_id, type, color, name, level, exp, stage,
+                        intimacy, coins, snacks, owned_items, equipped_items, last_visit
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        demo_id,
+                        "cat",
+                        "default",
+                        "피피",
+                        1,
+                        30,
+                        "baby",
+                        60,
+                        150,
+                        5,
+                        "[]",
+                        "[]",
+                        now,
+                    ),
+                )
+
+            # 3. 시연용 기본 일정 확인 및 최초 1회 생성
+            task_rows = conn.execute(
+                "SELECT id FROM tasks WHERE user_id = ?", (demo_id,)
+            ).fetchall()
+            if not task_rows:
+                task_1_id = f"demo_task_1_{hashlib.md5(demo_id.encode()).hexdigest()[:8]}"
+                task_2_id = f"demo_task_2_{hashlib.md5(demo_id.encode()).hexdigest()[:8]}"
+                conn.execute(
+                    """
+                    INSERT INTO tasks (
+                        id, user_id, title, duration_min, goal, start_date, end_date,
+                        alert_before, priority, category, placed_date, start_time,
+                        status, proof_image_path, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_1_id,
+                        demo_id,
+                        "PIPI 프로젝트 발표 경청하기",
+                        60,
+                        "프로젝트 소개 및 기능 시연 참관",
+                        today_date,
+                        today_date,
+                        10,
+                        "high",
+                        "activity",
+                        today_date,
+                        "14:00",
+                        "placed",
+                        None,
+                        None,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO tasks (
+                        id, user_id, title, duration_min, goal, start_date, end_date,
+                        alert_before, priority, category, placed_date, start_time,
+                        status, proof_image_path, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_2_id,
+                        demo_id,
+                        "펫 밥주기 및 일정 인증 완료해보기",
+                        30,
+                        "간식 주기와 사진 인증으로 캐릭터 성장시키기",
+                        today_date,
+                        today_date,
+                        10,
+                        "medium",
+                        "personal",
+                        today_date,
+                        "15:30",
+                        "placed",
+                        None,
+                        None,
+                    ),
+                )
 
     def _init_schema(self) -> None:
         with self._lock, self._connect() as conn:
@@ -213,7 +375,7 @@ class PipiDatabase:
         if len(password) < 4:
             raise ValueError("비밀번호는 최소 4자 이상이어야 합니다.")
 
-        pw_hash = sha256_hex(password)
+        pw_hash = hash_password(password)
         now = utc_now_iso()
         with self._lock, self._connect() as conn:
             exists = conn.execute(
@@ -239,7 +401,6 @@ class PipiDatabase:
         if not trimmed or not password:
             raise ValueError("아이디와 비밀번호를 입력해주세요.")
 
-        pw_hash = sha256_hex(password)
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT id, password_hash, created_at, intro_seen FROM users WHERE id = ?",
@@ -247,12 +408,24 @@ class PipiDatabase:
             ).fetchone()
             if row is None:
                 raise LookupError("가입되지 않은 아이디입니다.")
-            if row["password_hash"] != pw_hash:
+
+            is_valid, needs_rehash = verify_password(password, row["password_hash"])
+            if not is_valid:
                 raise PermissionError("비밀번호가 올바르지 않습니다.")
+
+            # 기존 레거시 SHA-256 사용자인 경우 최신 bcrypt로 무중단 투명 마이그레이션
+            current_hash = row["password_hash"]
+            if needs_rehash:
+                current_hash = hash_password(password)
+                conn.execute(
+                    "UPDATE users SET password_hash = ? WHERE id = ?",
+                    (current_hash, trimmed),
+                )
+
             token = self._create_session(conn, trimmed)
             return {
                 "id": row["id"],
-                "passwordHash": row["password_hash"],
+                "passwordHash": current_hash,
                 "createdAt": row["created_at"],
                 "introSeen": bool(row["intro_seen"]),
             }, token
@@ -1001,13 +1174,23 @@ def create_app(
     # 상태 주입
     _app.state.db = PipiDatabase(db_path=db_path)
 
-    # CORS 미들웨어 (모든 모바일 클라이언트 요청 허용)
+    cors_origins = [
+        origin.strip()
+        for origin in os.environ.get(
+            "ALLOWED_ORIGINS",
+            "http://localhost:3000,http://127.0.0.1:3000",
+        ).split(",")
+        if origin.strip()
+    ]
+
+    # CORS 미들웨어 (Cloudflare Pages 도메인 및 로컬/지정 오리진 허용, Bearer 토큰이므로 credentials=False)
     _app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=cors_origins,
+        allow_origin_regex=r"^https://[a-zA-Z0-9-]+\.pages\.dev$",
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization", "Accept"],
     )
 
     # 커스텀 에러 핸들러: 프론트엔드 호환 {"error": "..."} 형식
